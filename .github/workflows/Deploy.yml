@@ -1,4 +1,4 @@
-name: Build & Deploy to Fasthosts
+name: Build, Deploy, Auto-Rollback
 
 on:
   push:
@@ -9,21 +9,34 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build artifact (zip for record)
+      - name: Build ZIP artifact (for record)
         run: |
-          zip -r site.zip . -x "**/.git/**" "**/.github/**" "**/node_modules/**"
+          zip -r site.zip . \
+            -x "**/.git/**" "**/.github/**" "**/node_modules/**"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: site-zip
           path: site.zip
-          retention-days: 7
+          retention-days: 14
 
-      - name: FTP Deploy to /htdocs
+      - name: Pre-deploy snapshot on server (returns SNAP_ID)
+        id: snapshot
+        env:
+          SITE_URL:  ${{ secrets.SITE_URL }}        # e.g. https://aurorabp.co.uk
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          set -e
+          SNAP_JSON=$(curl -fsS -X POST "$SITE_URL/api/pre_deploy_snapshot.php" -d token="$API_TOKEN")
+          echo "$SNAP_JSON"
+          SNAP_ID=$(echo "$SNAP_JSON" | jq -r '.snap_id')
+          echo "snap_id=$SNAP_ID" >> $GITHUB_OUTPUT
+
+      - name: FTP deploy to /htdocs (atomic-ish)
         uses: SamKirkland/FTP-Deploy-Action@v4
         with:
           server: ${{ secrets.FTP_SERVER }}
@@ -37,11 +50,14 @@ jobs:
             **/.github/**
             **/node_modules/**
             site.zip
+            .editorconfig
 
       - name: Remote install / migrate / health
+        id: remote
+        continue-on-error: true
         env:
-          SITE_URL:   ${{ secrets.SITE_URL }}           # e.g. https://aurorabp.co.uk
-          API_TOKEN:  ${{ secrets.API_TOKEN }}          # strong random token
+          SITE_URL:   ${{ secrets.SITE_URL }}
+          API_TOKEN:  ${{ secrets.API_TOKEN }}
           DB_HOST:    ${{ secrets.DB_HOST }}
           DB_NAME:    ${{ secrets.DB_NAME }}
           DB_USER:    ${{ secrets.DB_USER }}
@@ -52,4 +68,17 @@ jobs:
             -d token="$API_TOKEN" \
             -d db_host="$DB_HOST" -d db_name="$DB_NAME" -d db_user="$DB_USER" -d db_pass="$DB_PASS"
           curl -fsS -X POST "$SITE_URL/api/migrate_json.php" -d token="$API_TOKEN"
-          curl -fsS "$SITE_URL/api/health.php"
+          curl -fsS "$SITE_URL/api/health.php" | tee health.json
+          jq -e '.ok == true' health.json >/dev/null
+
+      - name: Auto-rollback on failure
+        if: steps.remote.outcome != 'success'
+        env:
+          SITE_URL:   ${{ secrets.SITE_URL }}
+          API_TOKEN:  ${{ secrets.API_TOKEN }}
+          SNAP_ID:    ${{ steps.snapshot.outputs.snap_id }}
+        run: |
+          echo "Health failed — rolling back to snapshot: $SNAP_ID"
+          curl -fsS -X POST "$SITE_URL/api/rollback.php" -d token="$API_TOKEN" -d snap_id="$SNAP_ID"
+          curl -fsS "$SITE_URL/api/health.php" | tee health_after.json
+          jq -e '.ok == true' health_after.json >/dev/null
